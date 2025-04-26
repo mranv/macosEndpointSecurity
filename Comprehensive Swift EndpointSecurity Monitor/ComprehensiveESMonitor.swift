@@ -60,20 +60,45 @@ let PROT_READ: Int32 = 0x01
 let PROT_WRITE: Int32 = 0x02
 let PROT_EXEC: Int32 = 0x04
 
+// Exit status helpers - Swift doesn't support C macros, so we need to implement them as functions
+func _WSTATUS(_ x: Int32) -> Int32 {
+    return x & 0x7f
+}
+
+func WIFEXITED(_ x: Int32) -> Bool {
+    return _WSTATUS(x) == 0
+}
+
+func WEXITSTATUS(_ x: Int32) -> Int32 {
+    return (x >> 8) & 0xff
+}
+
+func WIFSIGNALED(_ x: Int32) -> Bool {
+    return _WSTATUS(x) != 0 && _WSTATUS(x) != 0x7f
+}
+
+func WTERMSIG(_ x: Int32) -> Int32 {
+    return _WSTATUS(x)
+}
+
+func WCOREDUMP(_ x: Int32) -> Bool {
+    return (x & 0x80) != 0
+}
+
 // MARK: - Utility Functions
 
-func dateFromTimeSpec(sec: Int, nsec: Int) -> String {
+func dateFromTimeSpec(sec: Int, usec: Int) -> String {
     let date = Date(timeIntervalSince1970: TimeInterval(sec))
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-    return "\(formatter.string(from: date)).\(nsec)"
+    return "\(formatter.string(from: date)).\(usec)"
 }
 
 func formatFlagsToString(_ flags: UInt32, _ flagsMap: [UInt32: String]) -> String {
     var result = ""
-    var origValue = flags
+    let origValue = flags
     var remainingFlags = flags
-    
+
     for (flag, name) in flagsMap {
         if flags & flag != 0 {
             if !result.isEmpty {
@@ -83,12 +108,21 @@ func formatFlagsToString(_ flags: UInt32, _ flagsMap: [UInt32: String]) -> Strin
             remainingFlags &= ~flag
         }
     }
-    
+
     if remainingFlags != 0 {
         result += " [\(String(remainingFlags, radix: 16))?]"
     }
-    
+
     return "\(result) (\(origValue))"
+}
+
+// Convert Int32 flagsMap to UInt32 flagsMap
+func convertFlagsMap(_ map: [Int32: String]) -> [UInt32: String] {
+    var result: [UInt32: String] = [:]
+    for (key, value) in map {
+        result[UInt32(key)] = value
+    }
+    return result
 }
 
 // MARK: - Event Data Models
@@ -118,7 +152,7 @@ struct ProcessInfo: Codable {
     var executablePath: String
     var threadId: UInt64
     var startTime: String
-    
+
     init(from process: UnsafeMutablePointer<es_process_t>) {
         let auditToken = process.pointee.audit_token
         self.pid = audit_token_to_pid(auditToken)
@@ -131,7 +165,7 @@ struct ProcessInfo: Codable {
         self.groupId = process.pointee.group_id
         self.sessionId = process.pointee.session_id
         self.codeSignFlags = process.pointee.codesigning_flags
-        
+
         // Create map for code signing flags
         let csFlags: [UInt32: String] = [
             CS_VALID: "CS_VALID",
@@ -163,36 +197,38 @@ struct ProcessInfo: Codable {
             CS_DEV_CODE: "CS_DEV_CODE",
             CS_DATAVAULT_CONTROLLER: "CS_DATAVAULT_CONTROLLER"
         ]
-        
+
         self.codeSignFlagsDesc = formatFlagsToString(self.codeSignFlags, csFlags)
         self.isPlatformBinary = process.pointee.is_platform_binary
         self.isEsClient = process.pointee.is_es_client
-        
+
         // Get signing ID
         if process.pointee.signing_id.length > 0 {
             self.signingId = String(cString: process.pointee.signing_id.data)
         } else {
             self.signingId = ""
         }
-        
+
         // Get team ID
         if process.pointee.team_id.length > 0 {
             self.teamId = String(cString: process.pointee.team_id.data)
         } else {
             self.teamId = ""
         }
-        
-        // Get executable path
-        if let executable = process.pointee.executable {
-            self.executablePath = String(cString: executable.pointee.path.data)
-        } else {
+
+        // Get executable path - using a safe approach
+        do {
+            self.executablePath = String(cString: process.pointee.executable.pointee.path.data)
+        } catch {
             self.executablePath = ""
         }
-        
+
         // Set thread ID and start time
         self.threadId = 0 // We'll set this from the thread pointee later
+
+        // Convert timeval (sec/usec) to a string
         self.startTime = dateFromTimeSpec(sec: Int(process.pointee.start_time.tv_sec),
-                                        nsec: Int(process.pointee.start_time.tv_nsec))
+                                         usec: Int(process.pointee.start_time.tv_usec))
     }
 }
 
@@ -201,11 +237,11 @@ struct BaseEvent: ESEvent {
     var eventTime: String
     var processInfo: ProcessInfo
     var isAuthentication: Bool
-    
+
     init(type: String, message: UnsafePointer<es_message_t>) {
         self.eventType = type
         self.eventTime = dateFromTimeSpec(sec: Int(message.pointee.time.tv_sec),
-                                        nsec: Int(message.pointee.time.tv_nsec))
+                                         usec: Int(message.pointee.time.tv_nsec))
         self.processInfo = ProcessInfo(from: message.pointee.process)
         self.isAuthentication = message.pointee.action_type == ES_ACTION_TYPE_AUTH
     }
@@ -214,20 +250,24 @@ struct BaseEvent: ESEvent {
 struct ExecEvent: Codable {
     var targetProcess: ProcessInfo
     var args: [String]
-    
+
     init(from event: UnsafePointer<es_message_t>) {
-        let execEvent = event.pointee.event.exec
-        self.targetProcess = ProcessInfo(from: execEvent.target)
-        
+        self.targetProcess = ProcessInfo(from: event.pointee.event.exec.target)
+
         // Parse command line arguments
         var arguments: [String] = []
-        let argCount = es_exec_arg_count(&event.pointee.event.exec)
-        
-        for i in 0..<argCount {
-            let arg = es_exec_arg(&event.pointee.event.exec, i)
-            arguments.append(String(cString: arg.data))
+
+        // Use withUnsafePointer to get a pointer to the exec event
+        var execEventCopy = event.pointee.event.exec
+        withUnsafePointer(to: &execEventCopy) { execEventPtr in
+            let argCount = es_exec_arg_count(execEventPtr)
+
+            for i in 0..<argCount {
+                let arg = es_exec_arg(execEventPtr, i)
+                arguments.append(String(cString: arg.data))
+            }
         }
-        
+
         self.args = arguments
     }
 }
@@ -236,19 +276,19 @@ struct OpenEvent: Codable {
     var filePath: String
     var fileFlags: Int32
     var fileFlagsDesc: String
-    
+
     init(from event: UnsafePointer<es_message_t>) {
         let openEvent = event.pointee.event.open
-        
-        // Get file path
-        if let file = openEvent.file {
-            self.filePath = String(cString: file.pointee.path.data)
-        } else {
+
+        // Get file path - using a safe approach
+        do {
+            self.filePath = String(cString: openEvent.file.pointee.path.data)
+        } catch {
             self.filePath = ""
         }
-        
+
         self.fileFlags = openEvent.fflag
-        
+
         // Create map for file open flags
         let flagsMap: [Int32: String] = [
             O_RDONLY: "O_RDONLY",
@@ -270,32 +310,33 @@ struct OpenEvent: Codable {
             O_CLOEXEC: "O_CLOEXEC",
             O_NOFOLLOW_ANY: "O_NOFOLLOW_ANY"
         ]
-        
-        self.fileFlagsDesc = formatFlagsToString(UInt32(self.fileFlags), flagsMap.mapValues { $0 })
+
+        // Convert Int32 map to UInt32 map for our helper function
+        self.fileFlagsDesc = formatFlagsToString(UInt32(self.fileFlags), convertFlagsMap(flagsMap))
     }
 }
 
 struct CloseEvent: Codable {
     var filePath: String
     var modified: Bool
-    
+
     init(from event: UnsafePointer<es_message_t>) {
         let closeEvent = event.pointee.event.close
-        
-        // Get file path
-        if let file = closeEvent.target {
-            self.filePath = String(cString: file.pointee.path.data)
-        } else {
+
+        // Get file path - using a safe approach
+        do {
+            self.filePath = String(cString: closeEvent.target.pointee.path.data)
+        } catch {
             self.filePath = ""
         }
-        
+
         self.modified = closeEvent.modified
     }
 }
 
 struct ForkEvent: Codable {
     var childProcess: ProcessInfo
-    
+
     init(from event: UnsafePointer<es_message_t>) {
         let forkEvent = event.pointee.event.fork
         self.childProcess = ProcessInfo(from: forkEvent.child)
@@ -305,17 +346,18 @@ struct ForkEvent: Codable {
 struct ExitEvent: Codable {
     var status: Int32
     var statusDescription: String
-    
+
     init(from event: UnsafePointer<es_message_t>) {
         let exitEvent = event.pointee.event.exit
         self.status = exitEvent.stat
-        
+
         // Parse the status according to wait(2)
-        if WIFEXITED(Int32(self.status)) {
-            self.statusDescription = "normal exit with code \(WEXITSTATUS(Int32(self.status)))"
-        } else if WIFSIGNALED(Int32(self.status)) {
-            let signal = WTERMSIG(Int32(self.status))
-            let coreDump = WCOREDUMP(Int32(self.status)) ? " (coredump created)" : ""
+        // Use our helper functions instead of C macros
+        if WIFEXITED(self.status) {
+            self.statusDescription = "normal exit with code \(WEXITSTATUS(self.status))"
+        } else if WIFSIGNALED(self.status) {
+            let signal = WTERMSIG(self.status)
+            let coreDump = WCOREDUMP(self.status) ? " (coredump created)" : ""
             self.statusDescription = "killed by signal \(signal)\(coreDump)"
         } else {
             self.statusDescription = "unknown exit status"
@@ -325,14 +367,14 @@ struct ExitEvent: Codable {
 
 struct UnlinkEvent: Codable {
     var filePath: String
-    
+
     init(from event: UnsafePointer<es_message_t>) {
         let unlinkEvent = event.pointee.event.unlink
-        
-        // Get file path
-        if let file = unlinkEvent.target {
-            self.filePath = String(cString: file.pointee.path.data)
-        } else {
+
+        // Get file path - using a safe approach
+        do {
+            self.filePath = String(cString: unlinkEvent.target.pointee.path.data)
+        } catch {
             self.filePath = ""
         }
     }
@@ -340,14 +382,14 @@ struct UnlinkEvent: Codable {
 
 struct ChdirEvent: Codable {
     var directoryPath: String
-    
+
     init(from event: UnsafePointer<es_message_t>) {
         let chdirEvent = event.pointee.event.chdir
-        
-        // Get directory path
-        if let file = chdirEvent.target {
-            self.directoryPath = String(cString: file.pointee.path.data)
-        } else {
+
+        // Get directory path - using a safe approach
+        do {
+            self.directoryPath = String(cString: chdirEvent.target.pointee.path.data)
+        } catch {
             self.directoryPath = ""
         }
     }
@@ -356,11 +398,12 @@ struct ChdirEvent: Codable {
 struct SignalEvent: Codable {
     var targetProcess: ProcessInfo
     var signal: UInt32
-    
+
     init(from event: UnsafePointer<es_message_t>) {
         let signalEvent = event.pointee.event.signal
         self.targetProcess = ProcessInfo(from: signalEvent.target)
-        self.signal = signalEvent.sig
+        // Convert Int32 to UInt32 for the signal
+        self.signal = UInt32(signalEvent.sig)
     }
 }
 
@@ -373,22 +416,22 @@ struct MmapEvent: Codable {
     var maxProtectionDesc: String
     var protection: Int32
     var protectionDesc: String
-    
+
     init(from event: UnsafePointer<es_message_t>) {
         let mmapEvent = event.pointee.event.mmap
-        
-        // Get file path
-        if let file = mmapEvent.source {
-            self.filePath = String(cString: file.pointee.path.data)
-        } else {
+
+        // Get file path - using a safe approach
+        do {
+            self.filePath = String(cString: mmapEvent.source.pointee.path.data)
+        } catch {
             self.filePath = ""
         }
-        
+
         self.filePos = mmapEvent.file_pos
         self.flags = mmapEvent.flags
         self.maxProtection = mmapEvent.max_protection
         self.protection = mmapEvent.protection
-        
+
         // Create map for mmap protection flags
         let protFlags: [Int32: String] = [
             PROT_NONE: "PROT_NONE",
@@ -396,10 +439,12 @@ struct MmapEvent: Codable {
             PROT_WRITE: "PROT_WRITE",
             PROT_EXEC: "PROT_EXEC"
         ]
-        
-        self.maxProtectionDesc = formatFlagsToString(UInt32(self.maxProtection), protFlags.mapValues { $0 })
-        self.protectionDesc = formatFlagsToString(UInt32(self.protection), protFlags.mapValues { $0 })
-        
+
+        // Convert Int32 map to UInt32 map for our helper function
+        let protFlagsUInt32 = convertFlagsMap(protFlags)
+        self.maxProtectionDesc = formatFlagsToString(UInt32(self.maxProtection), protFlagsUInt32)
+        self.protectionDesc = formatFlagsToString(UInt32(self.protection), protFlagsUInt32)
+
         // Create map for mmap flags (not complete, would need to add more)
         let mmapFlagsMap: [Int32: String] = [
             0x0001: "MAP_SHARED",
@@ -407,8 +452,9 @@ struct MmapEvent: Codable {
             0x0010: "MAP_FIXED",
             0x1000: "MAP_ANON"
         ]
-        
-        self.flagsDesc = formatFlagsToString(UInt32(self.flags), mmapFlagsMap.mapValues { $0 })
+
+        // Convert Int32 map to UInt32 map for our helper function
+        self.flagsDesc = formatFlagsToString(UInt32(self.flags), convertFlagsMap(mmapFlagsMap))
     }
 }
 
@@ -417,7 +463,7 @@ struct MmapEvent: Codable {
 struct ComprehensiveESEvent: Codable {
     var id = UUID()
     var baseEvent: BaseEvent
-    
+
     // Event-specific fields
     var execEvent: ExecEvent?
     var openEvent: OpenEvent?
@@ -428,11 +474,11 @@ struct ComprehensiveESEvent: Codable {
     var chdirEvent: ChdirEvent?
     var signalEvent: SignalEvent?
     var mmapEvent: MmapEvent?
-    
+
     init(fromRawEvent rawEvent: UnsafePointer<es_message_t>) {
         // Set thread ID in process info
         var baseEventType = "UNKNOWN"
-        
+
         // Determine event type
         switch rawEvent.pointee.event_type {
         case ES_EVENT_TYPE_NOTIFY_EXEC, ES_EVENT_TYPE_AUTH_EXEC:
@@ -465,7 +511,7 @@ struct ComprehensiveESEvent: Codable {
         default:
             break
         }
-        
+
         self.baseEvent = BaseEvent(type: baseEventType, message: rawEvent)
     }
 }
@@ -477,7 +523,7 @@ class ComprehensiveESMonitor {
     private var monitoredProcessPath: String?
     private var monitoredProcesses: [pid_t: Bool] = [:]
     private var excludedProcesses: [pid_t: Bool] = [:]
-    
+
     // Configuration options
     struct Config {
         var excludeSelf: Bool = true
@@ -486,9 +532,9 @@ class ComprehensiveESMonitor {
         var jsonOutput: Bool = true
         var verbose: Bool = false
     }
-    
+
     private var config = Config()
-    
+
     // All supported event types
     let supportedEvents: [(String, [es_event_type_t])] = [
         ("access", [ES_EVENT_TYPE_NOTIFY_ACCESS]),
@@ -522,29 +568,29 @@ class ComprehensiveESMonitor {
         ("unlink", [ES_EVENT_TYPE_NOTIFY_UNLINK, ES_EVENT_TYPE_AUTH_UNLINK]),
         ("write", [ES_EVENT_TYPE_NOTIFY_WRITE])
     ]
-    
+
     init(configuration: Config? = nil) {
         if let config = configuration {
             self.config = config
         }
-        
+
         if self.config.eventTypes.isEmpty {
             // Default to subscribing to all events
             for (_, events) in supportedEvents {
                 self.config.eventTypes.append(contentsOf: events)
             }
         }
-        
+
         if let path = self.config.monitorProcessPath {
             self.monitoredProcessPath = path
         }
     }
-    
+
     // Convert event to JSON string
     private func eventToJSON(_ event: ComprehensiveESEvent) -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes]
-        
+
         do {
             let data = try encoder.encode(event)
             return String(data: data, encoding: .utf8) ?? "{\"error\":\"Failed to encode event\"}"
@@ -552,105 +598,105 @@ class ComprehensiveESMonitor {
             return "{\"error\":\"Failed to encode event: \(error.localizedDescription)\"}"
         }
     }
-    
+
     // Format event for text output
     private func formatEvent(_ event: ComprehensiveESEvent) -> String {
         var output = "event : \(event.baseEvent.eventType)\n"
         output += "  time: \(event.baseEvent.eventTime)\n"
-        
+
         // Add event-specific details
         if let execEvent = event.execEvent {
             output += "  executable: \(execEvent.targetProcess.executablePath)\n"
             output += "  args: \(execEvent.args.joined(separator: " "))\n"
         }
-        
+
         if let openEvent = event.openEvent {
             output += "  file: \(openEvent.filePath)\n"
             output += "  flags: \(openEvent.fileFlagsDesc)\n"
         }
-        
+
         if let closeEvent = event.closeEvent {
             output += "  file: \(closeEvent.filePath)\n"
             output += "  modified: \(closeEvent.modified)\n"
         }
-        
+
         if let forkEvent = event.forkEvent {
             output += "  child_pid: \(forkEvent.childProcess.pid)\n"
         }
-        
+
         if let exitEvent = event.exitEvent {
             output += "  status: \(exitEvent.status)\n"
             output += "  reason: \(exitEvent.statusDescription)\n"
         }
-        
+
         if let unlinkEvent = event.unlinkEvent {
             output += "  file: \(unlinkEvent.filePath)\n"
         }
-        
+
         if let chdirEvent = event.chdirEvent {
             output += "  directory: \(chdirEvent.directoryPath)\n"
         }
-        
+
         if let signalEvent = event.signalEvent {
             output += "  target_pid: \(signalEvent.targetProcess.pid)\n"
             output += "  signal: \(signalEvent.signal)\n"
         }
-        
+
         if let mmapEvent = event.mmapEvent {
             output += "  file: \(mmapEvent.filePath)\n"
             output += "  protection: \(mmapEvent.protectionDesc)\n"
             output += "  flags: \(mmapEvent.flagsDesc)\n"
         }
-        
+
         // Add process info
         output += " process:\n"
         output += "        PID: \(event.baseEvent.processInfo.pid)\n"
         output += "       EUID: \(event.baseEvent.processInfo.euid)\n"
         output += "       EGID: \(event.baseEvent.processInfo.egid)\n"
         output += "       PPID: \(event.baseEvent.processInfo.ppid)\n"
-        
+
         if event.baseEvent.processInfo.ruid != event.baseEvent.processInfo.euid {
             output += "       RUID: \(event.baseEvent.processInfo.ruid)\n"
         }
-        
+
         if event.baseEvent.processInfo.rgid != event.baseEvent.processInfo.egid {
             output += "       RGID: \(event.baseEvent.processInfo.rgid)\n"
         }
-        
+
         output += "        GID: \(event.baseEvent.processInfo.groupId)\n"
         output += "        SID: \(event.baseEvent.processInfo.sessionId)\n"
         output += "       Path: \(event.baseEvent.processInfo.executablePath)\n"
         output += "    CSFlags: \(event.baseEvent.processInfo.codeSignFlagsDesc)\n"
-        
+
         if !event.baseEvent.processInfo.signingId.isEmpty {
             output += "   SigningID: \(event.baseEvent.processInfo.signingId)\n"
         }
-        
+
         if !event.baseEvent.processInfo.teamId.isEmpty {
             output += "     TeamID: \(event.baseEvent.processInfo.teamId)\n"
         }
-        
+
         output += "    Started: \(event.baseEvent.processInfo.startTime)\n"
-        
+
         let extraInfo = [
             event.baseEvent.processInfo.isPlatformBinary ? "platform_binary" : "",
             event.baseEvent.processInfo.isEsClient ? "es_client" : ""
         ].filter { !$0.isEmpty }.joined(separator: " ")
-        
+
         if !extraInfo.isEmpty {
             output += "      Extra: \(extraInfo)\n"
         }
-        
+
         output += "\n"
-        
+
         return output
     }
-    
+
     // Process events and handle authorization responses
     private func handleEvent(_ message: UnsafePointer<es_message_t>) {
         // Check if this is our own process
         let pid = audit_token_to_pid(message.pointee.process.pointee.audit_token)
-        
+
         // Skip processing for our own process if configured
         if config.excludeSelf && pid == getpid() {
             if let client = self.esClient {
@@ -658,18 +704,18 @@ class ComprehensiveESMonitor {
             }
             return
         }
-        
+
         // Skip processing for excluded processes
         if excludedProcesses[pid] == true {
             return
         }
-        
+
         // Check if we're monitoring specific processes
         if let path = monitoredProcessPath {
             let processPath = String(cString: message.pointee.process.pointee.executable.pointee.path.data)
             if !processPath.hasPrefix(path) && monitoredProcesses[pid] != true {
                 // If this is an exec event, check if the target is a monitored process
-                if message.pointee.event_type == ES_EVENT_TYPE_NOTIFY_EXEC || 
+                if message.pointee.event_type == ES_EVENT_TYPE_NOTIFY_EXEC ||
                    message.pointee.event_type == ES_EVENT_TYPE_AUTH_EXEC {
                     let targetPath = String(cString: message.pointee.event.exec.target.pointee.executable.pointee.path.data)
                     if targetPath.hasPrefix(path) {
@@ -681,7 +727,7 @@ class ComprehensiveESMonitor {
                 return
             }
         }
-        
+
         // Track fork events to monitor child processes
         if message.pointee.event_type == ES_EVENT_TYPE_NOTIFY_FORK {
             let childPid = audit_token_to_pid(message.pointee.event.fork.child.pointee.audit_token)
@@ -689,22 +735,22 @@ class ComprehensiveESMonitor {
                 monitoredProcesses[childPid] = true
             }
         }
-        
+
         // Handle exit events to cleanup process tracking
         if message.pointee.event_type == ES_EVENT_TYPE_NOTIFY_EXIT {
             monitoredProcesses.removeValue(forKey: pid)
         }
-        
+
         // Create event object
         let event = ComprehensiveESEvent(fromRawEvent: message)
-        
+
         // Log the event
         if config.jsonOutput {
             print(eventToJSON(event))
         } else {
             print(formatEvent(event))
         }
-        
+
         // Handle authorization responses
         if message.pointee.action_type == ES_ACTION_TYPE_AUTH {
             if let client = self.esClient {
@@ -722,16 +768,16 @@ class ComprehensiveESMonitor {
             }
         }
     }
-    
+
     // Create the ES client and start monitoring
     func startMonitoring() -> Bool {
         var client: OpaquePointer?
-        
+
         // Create new ES client
         let result = es_new_client(&client) { [weak self] _, event in
             self?.handleEvent(event)
         }
-        
+
         // Check result
         switch result {
         case ES_NEW_CLIENT_RESULT_SUCCESS:
@@ -760,9 +806,9 @@ class ComprehensiveESMonitor {
             print("[ERROR] Unknown error creating ES client: \(result.rawValue)")
             return false
         }
-        
+
         self.esClient = client
-        
+
         // Subscribe to events
         if es_subscribe(client!, self.config.eventTypes, UInt32(self.config.eventTypes.count)) != ES_RETURN_SUCCESS {
             print("[ERROR] Failed to subscribe to events")
@@ -770,16 +816,16 @@ class ComprehensiveESMonitor {
             self.esClient = nil
             return false
         }
-        
+
         if config.verbose {
             print("[INFO] Successfully subscribed to events")
         }
-        
+
         // Exclude our own process if needed
-        if config.excludeSelf, let client = self.esClient {
+        if config.excludeSelf {
             let selfPid = getpid()
             excludedProcesses[selfPid] = true
-            
+
             // We need to get our own audit token to mute ourselves
             // This is a bit tricky in Swift, but we can use a trick to get it
             DispatchQueue.global().async {
@@ -787,10 +833,10 @@ class ComprehensiveESMonitor {
                 sleep(1)
             }
         }
-        
+
         return true
     }
-    
+
     // Stop monitoring and cleanup
     func stopMonitoring() {
         if let client = self.esClient {
@@ -805,16 +851,16 @@ class ComprehensiveESMonitor {
 func parseCommandLineArgs() -> ComprehensiveESMonitor.Config {
     var config = ComprehensiveESMonitor.Config()
     var argIndex = 1
-    
+
     while argIndex < CommandLine.arguments.count {
         let arg = CommandLine.arguments[argIndex]
-        
+
         switch arg {
         case "-e", "--event":
             if argIndex + 1 < CommandLine.arguments.count {
                 argIndex += 1
                 let events = CommandLine.arguments[argIndex].split(separator: ",")
-                
+
                 if events.contains("all") {
                     // Subscribe to all events
                     let monitor = ComprehensiveESMonitor()
@@ -828,7 +874,7 @@ func parseCommandLineArgs() -> ComprehensiveESMonitor.Config {
                         var eventName = String(event)
                         var isAuthEvent = false
                         var isRemove = false
-                        
+
                         // Check for +/- prefix
                         if eventName.hasPrefix("+") {
                             isAuthEvent = true
@@ -837,7 +883,7 @@ func parseCommandLineArgs() -> ComprehensiveESMonitor.Config {
                             isRemove = true
                             eventName.removeFirst()
                         }
-                        
+
                         // Find the event type
                         if let eventInfo = monitor.supportedEvents.first(where: { $0.0 == eventName }) {
                             if isRemove {
@@ -878,10 +924,10 @@ func parseCommandLineArgs() -> ComprehensiveESMonitor.Config {
             printUsage()
             exit(1)
         }
-        
+
         argIndex += 1
     }
-    
+
     return config
 }
 
@@ -896,14 +942,14 @@ func printUsage() {
       -v, --verbose         Enable verbose logging
           --include-self    Include events from this process (not recommended)
       -h, --help            Show this help message
-    
+
     Examples:
       ComprehensiveESMonitor -e all                    # Monitor all events
       ComprehensiveESMonitor -e exec,open,close -t     # Monitor specific events with text output
       ComprehensiveESMonitor -e all,-mprotect          # Monitor all events except mprotect
       ComprehensiveESMonitor -p /Applications          # Only monitor processes in /Applications
     """)
-    
+
     // Print available events
     print("\nAvailable events:")
     let monitor = ComprehensiveESMonitor()
@@ -921,25 +967,25 @@ func main() {
         print("Error: This program must be run as root.")
         exit(1)
     }
-    
+
     // Parse command-line arguments
     let config = parseCommandLineArgs()
-    
+
     // Create and start the monitor
     let monitor = ComprehensiveESMonitor(configuration: config)
     if !monitor.startMonitoring() {
         print("Failed to start monitoring")
         exit(1)
     }
-    
+
     print("Monitoring started. Press Ctrl+C to exit.")
-    
+
     // Setup signal handler for clean exit
     signal(SIGINT) { _ in
         print("\nShutting down...")
         exit(0)
     }
-    
+
     // Run forever until interrupted
     dispatchMain()
 }
